@@ -18,6 +18,8 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -62,6 +64,7 @@ header.sticky{top:0;padding-top:calc(1.25rem + env(safe-area-inset-top,0px))}asi
     <div class="w-10 h-10 rounded-xl bg-zinc-100 text-zinc-950 flex items-center justify-center"><i class="fa-solid fa-wallet"></i></div>
     <div><div class="font-extrabold">FinanceOS</div><div class="text-xs text-zinc-500">Mon argent, simplement.</div></div>
   </div>
+  <div class="-mt-5 mb-6"><button id="syncPill" class="pill" onclick="openSyncModal()" title="Synchronisation"><span class="dot"></span>Synchro</button></div>
   <nav class="space-y-2">
     <button class="nav-btn active" data-page="home" onclick="showPage('home',this)"><i class="fa-solid fa-house w-5"></i> Accueil</button>
     <button class="nav-btn" data-page="bilan" onclick="showPage('bilan',this)"><i class="fa-solid fa-scale-balanced w-5"></i> Bilan</button>
@@ -97,6 +100,7 @@ header.sticky{top:0;padding-top:calc(1.25rem + env(safe-area-inset-top,0px))}asi
       </div>
     </div>
     <div class="flex items-center gap-2">
+      <button id="syncDot" class="dot" onclick="openSyncModal()" title="Synchronisation" style="width:10px;height:10px"></button>
       <button class="btn btn-secondary" onclick="togglePrivacy()" title="Mode discret (masque les montants)"><i id="privIcon" class="fa-solid fa-eye"></i></button>
       <button class="btn btn-primary" onclick="editSalary()"><i class="fa-solid fa-pen mr-1"></i><span class="hidden sm:inline">Modifier mon </span>salaire</button>
     </div>
@@ -413,8 +417,66 @@ if(!Array.isArray(out.bank.eb.accounts))out.bank.eb.accounts=[];
 if(out.bank.eb.accountUid&&!out.bank.eb.accounts.length)out.bank.eb.accounts=[{uid:out.bank.eb.accountUid}];
 if(/^gemini-2\.5-(flash|pro)$/.test(out.ai.model))out.ai.model="gemini-3.5-flash-lite";
 out.version=4;return out}
-function loadData(){try{const raw=localStorage.getItem(STORAGE_KEY);if(!raw)return structuredClone(defaultData);return mergeData(JSON.parse(raw))}catch{return structuredClone(defaultData)}}
-function persist(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(data))}catch(e){toast("Stockage plein : fais une sauvegarde puis vide des transactions")}}
+function pickSecrets(d){return{apiKey:d.markets.apiKey||"",eodKey:d.markets.eodKey||"",finnhubKey:d.markets.finnhubKey||"",aiKey:d.ai.key||"",pem:d.bank.eb.pem||"",proxyToken:d.bank.eb.proxyToken||""}}
+function applySecrets(d,x){if(!x)return;d.markets.apiKey=x.apiKey||d.markets.apiKey||"";d.markets.eodKey=x.eodKey||d.markets.eodKey||"";d.markets.finnhubKey=x.finnhubKey||d.markets.finnhubKey||"";d.ai.key=x.aiKey||d.ai.key||"";d.bank.eb.pem=x.pem||d.bank.eb.pem||"";d.bank.eb.proxyToken=x.proxyToken||d.bank.eb.proxyToken||""}
+function stripSecrets(d){const c=structuredClone(d);c.markets.apiKey="";c.markets.eodKey="";c.markets.finnhubKey="";c.ai.key="";c.bank.eb.pem="";c.bank.eb.proxyToken="";return c}
+const SECRET_KEY="financeos_secrets_v1";
+function loadData(){let d;try{const raw=localStorage.getItem(STORAGE_KEY);d=raw?mergeData(JSON.parse(raw)):structuredClone(defaultData)}catch{d=structuredClone(defaultData)}try{applySecrets(d,JSON.parse(localStorage.getItem(SECRET_KEY)||"null"))}catch{}return d}
+function persistLocal(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(data));localStorage.setItem(SECRET_KEY,JSON.stringify(pickSecrets(data)))}catch(e){toast("Stockage plein : fais une sauvegarde puis vide des transactions")}}
+function persist(){persistLocal();cloudSchedule()}
+
+/* =========================================================
+   SYNCHRO — Supabase (table financeos_state, une ligne par compte)
+   Les clés API restent sur chaque appareil, jamais envoyées.
+   ========================================================= */
+const SYNC_CFG_KEY="financeos_sync_cfg",PENDING_KEY="financeos_pending_v1",SYNC_USER_KEY="financeos_sync_user";
+const Sync={client:null,user:null,ready:false,lastJson:null,rev:null,chain:Promise.resolve(),timer:null,status:"off",chan:null,pendingRow:null,pulling:false};
+function syncCfg(){const c=window.FINANCEOS_SUPABASE||{};if(c.url&&c.anonKey)return c;try{const x=JSON.parse(localStorage.getItem(SYNC_CFG_KEY)||"null");if(x&&x.url&&x.anonKey)return x}catch{}return null}
+function setSync(st){Sync.status=st;const M={off:["","Synchro à configurer"],out:["off","Synchro : non connecté"],loading:["","Synchronisation…"],ok:["on","Synchronisé"],saving:["","Enregistrement…"],error:["off","Synchro en échec"],offline:["","Hors ligne"]};const[c,l]=M[st]||M.off;setHtml("syncPill",`<span class="dot ${c}"></span>${l}`);const d=document.getElementById("syncDot");if(d){d.className="dot "+c;d.title=l}}
+function stateJson(){const c=stripSecrets(data);delete c.updatedAt;return JSON.stringify(c)}
+function cloudSchedule(){if(!Sync.ready)return;try{localStorage.setItem(PENDING_KEY,"1")}catch{}clearTimeout(Sync.timer);Sync.timer=setTimeout(cloudPush,1200)}
+function cloudPush(){clearTimeout(Sync.timer);Sync.timer=null;Sync.chain=Sync.chain.then(doPush).catch(e=>{console.error("sync push",e);setSync(navigator.onLine===false?"offline":"error")});return Sync.chain}
+async function doPush(){if(!Sync.ready)return;const j=stateJson();if(j===Sync.lastJson){try{localStorage.removeItem(PENDING_KEY)}catch{}setSync("ok");return}
+setSync("saving");const rev=crypto.randomUUID(),now=new Date().toISOString();const res=await Sync.client.from("financeos_state").upsert({user_id:Sync.user.id,data:JSON.parse(j),rev,updated_at:now});if(res.error)throw res.error;
+Sync.rev=rev;Sync.lastJson=j;data.updatedAt=Date.parse(now);persistLocal();try{localStorage.removeItem(PENDING_KEY)}catch{}setSync("ok")}
+async function fetchRow(){const res=await Sync.client.from("financeos_state").select("data,rev,updated_at").eq("user_id",Sync.user.id).maybeSingle();if(res.error)throw res.error;return res.data}
+function adoptRow(row){const sec=pickSecrets(data);data=mergeData(row.data||{});applySecrets(data,sec);data.updatedAt=Date.parse(row.updated_at)||0;Sync.rev=row.rev;Sync.pendingRow=null;ensureCurrentMonth();Sync.lastJson=stateJson();persistLocal();render();renderEBZone();connectCryptoWS();if(!document.getElementById("chatPanel").classList.contains("hidden"))renderChat()}
+function applyPendingRow(){if(Sync.pendingRow&&!chatBusy&&!document.getElementById("modalBg").classList.contains("show")){adoptRow(Sync.pendingRow);toast("Mis à jour depuis un autre appareil")}}
+async function pullRemote(){if(Sync.pulling||!Sync.ready)return;Sync.pulling=true;try{if(Sync.timer)await cloudPush();const row=await fetchRow();if(row&&row.rev!==Sync.rev){if(chatBusy||document.getElementById("modalBg").classList.contains("show"))Sync.pendingRow=row;else{adoptRow(row);toast("Mis à jour depuis un autre appareil")}}if(Sync.status!=="saving")setSync("ok")}catch(e){console.warn("sync pull",e);setSync(navigator.onLine===false?"offline":"error")}finally{Sync.pulling=false}}
+function subscribeSync(){if(Sync.chan){try{Sync.client.removeChannel(Sync.chan)}catch{}}Sync.chan=Sync.client.channel("fos-"+Sync.user.id).on("postgres_changes",{event:"*",schema:"public",table:"financeos_state",filter:"user_id=eq."+Sync.user.id},p=>{const r=p&&p.new&&p.new.rev;if(r&&r!==Sync.rev)pullRemote()}).subscribe()}
+async function syncStart(user){if(Sync.user&&Sync.user.id===user.id&&(Sync.ready||Sync.starting))return;Sync.user=user;Sync.ready=false;Sync.starting=true;setSync("loading");
+try{const row=await fetchRow();let pending=false;try{pending=localStorage.getItem(PENDING_KEY)==="1"}catch{}const firstHere=localStorage.getItem(SYNC_USER_KEY)!==user.id;
+let pushLocal=false;
+if(!row)pushLocal=true;
+else if(firstHere){if(isPristine())adoptRow(row);else{pushLocal=!confirm("Ton compte contient déjà des données FinanceOS.\n\nOK = utiliser les données du compte (recommandé)\nAnnuler = les remplacer par celles de cet appareil");if(!pushLocal)adoptRow(row);else Sync.rev=row.rev}}
+else if(pending&&(Date.parse(row.updated_at)||0)<=num(data.updatedAt)){pushLocal=true;Sync.rev=row.rev}
+else adoptRow(row);
+try{localStorage.setItem(SYNC_USER_KEY,user.id)}catch{}Sync.ready=true;
+if(pushLocal){Sync.lastJson=null;await cloudPush()}else setSync("ok");
+subscribeSync();renderConnBadge()}
+catch(e){console.error("sync start",e);setSync(navigator.onLine===false?"offline":"error");toast("Synchro impossible : "+(e.message||"erreur"))}
+finally{Sync.starting=false}}
+async function syncInit(){const cfg=syncCfg();if(!cfg){setSync("off");return}if(!window.supabase||!window.supabase.createClient){setSync("offline");return}
+Sync.client=window.supabase.createClient(cfg.url,cfg.anonKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+Sync.client.auth.onAuthStateChange((ev,ses)=>{if(ev==="PASSWORD_RECOVERY"){setTimeout(()=>openSyncModal("reset"),300);return}if((ev==="SIGNED_IN"||ev==="INITIAL_SESSION")&&ses&&ses.user)setTimeout(()=>syncStart(ses.user),0);if(ev==="SIGNED_OUT"){Sync.ready=false;Sync.user=null;if(Sync.chan){try{Sync.client.removeChannel(Sync.chan)}catch{}Sync.chan=null}setSync("out")}});
+const r=await Sync.client.auth.getSession();const ses=r&&r.data&&r.data.session;
+if(ses)syncStart(ses.user);
+else{setSync("out");let asked=false;try{asked=!!localStorage.getItem("financeos_sync_asked");localStorage.setItem("financeos_sync_asked","1")}catch{}if(!asked)setTimeout(()=>openSyncModal(),900)}}
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden"){if(Sync.timer)cloudPush()}else pullRemote()});
+window.addEventListener("online",()=>{if(Sync.ready){cloudPush();pullRemote()}});
+const authMsg=e=>{const m=String(e&&e.message||e||"");return /invalid login/i.test(m)?"E-mail ou mot de passe incorrect.":/not confirmed/i.test(m)?"Confirme d'abord ton e-mail : clique sur le lien reçu par mail, puis reviens te connecter.":/already registered|already exists/i.test(m)?"Ce compte existe déjà : clique sur « Se connecter ».":/password/i.test(m)&&/6|short|least/i.test(m)?"Mot de passe trop court (6 caractères minimum).":/signups? not allowed|disabled/i.test(m)?"Les nouveaux comptes sont désactivés sur ton projet Supabase.":/fetch|network/i.test(m)?"Pas de connexion internet.":m||"Erreur inconnue."};
+function openSyncModal(mode){const cfg=syncCfg();
+if(!cfg){openModal("Synchronisation",`<p class="text-sm text-zinc-400 mb-4">La synchro entre ton téléphone et ton PC passe par ton projet Supabase (gratuit). Colle ici l'URL du projet et sa clé publique (anon / publishable). Ne colle jamais la clé « service_role » ou « secret ».</p><label class="block text-xs text-zinc-500 mb-1">Project URL</label><input id="sbUrl" class="input mb-3" placeholder="https://xxxx.supabase.co"><label class="block text-xs text-zinc-500 mb-1">Clé publique (anon / publishable)</label><input id="sbKey" class="input" placeholder="eyJ… ou sb_publishable_…"><div id="sbMsg" class="text-xs text-red-400 mt-2"></div><div class="flex justify-end gap-2 mt-6"><button class="btn btn-secondary" onclick="closeModal()">Plus tard</button><button class="btn btn-primary" onclick="saveSyncCfg()">Enregistrer</button></div>`);return}
+if(mode==="reset"){openModal("Nouveau mot de passe",`<label class="block text-xs text-zinc-500 mb-1">Nouveau mot de passe</label><input id="sbNewPw" class="input" type="password" autocomplete="new-password"><div id="sbMsg" class="text-xs mt-2"></div><div class="flex justify-end gap-2 mt-6"><button class="btn btn-primary" onclick="syncNewPassword()">Enregistrer</button></div>`);return}
+if(Sync.user){openModal("Synchronisation",`<div class="p-4 rounded-xl bg-zinc-900 text-sm"><div class="flex items-center gap-2"><span class="dot ${Sync.status==="ok"?"on":""}"></span><strong>${Sync.status==="ok"?"Synchronisé":escapeHtml(document.getElementById("syncPill").textContent)}</strong></div><div class="text-zinc-500 mt-1">Connecté : ${escapeHtml(Sync.user.email||"")}</div><div class="text-zinc-500 mt-1">Tes données suivent sur tous les appareils où tu es connecté. Tes clés API restent sur chaque appareil.</div></div><div class="flex flex-wrap justify-end gap-2 mt-6"><button class="btn btn-secondary" onclick="syncSignOut()">Se déconnecter</button><button class="btn btn-primary" onclick="closeModal();pullRemote().then(cloudPush);toast('Synchronisation…')">Synchroniser maintenant</button></div>`);return}
+openModal("Synchronisation",`<p class="text-sm text-zinc-400 mb-4">Connecte-toi pour retrouver les mêmes données sur ton téléphone et ton ordinateur, en temps réel.</p><label class="block text-xs text-zinc-500 mb-1">E-mail</label><input id="sbEmail" class="input mb-3" type="email" autocomplete="email" value="${escapeAttr(localStorage.getItem("financeos_sync_email")||"")}"><label class="block text-xs text-zinc-500 mb-1">Mot de passe</label><input id="sbPw" class="input" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')syncSignIn()"><div id="sbMsg" class="text-xs mt-2"></div><div class="flex flex-wrap justify-between gap-2 mt-6"><button class="text-xs text-zinc-500 underline" onclick="syncForgot()">Mot de passe oublié</button><div class="flex gap-2"><button class="btn btn-secondary" onclick="syncSignUp()">Créer mon compte</button><button class="btn btn-primary" onclick="syncSignIn()">Se connecter</button></div></div>`)}
+function sbMsg(t,ok){const m=document.getElementById("sbMsg");if(m){m.className="text-xs mt-2 "+(ok?"text-emerald-400":"text-red-400");m.textContent=t}}
+function saveSyncCfg(){const url=document.getElementById("sbUrl").value.trim().replace(/\/+$/,""),anonKey=document.getElementById("sbKey").value.trim();if(!/^https:\/\/.+/.test(url)||anonKey.length<20){sbMsg("Vérifie l'URL (https://…supabase.co) et la clé.");return}if(/service_role|sb_secret_/.test(anonKey)){sbMsg("C'est la clé secrète : prends la clé publique (anon / publishable).");return}try{localStorage.setItem(SYNC_CFG_KEY,JSON.stringify({url,anonKey}))}catch{}closeModal();toast("Configuration enregistrée");location.reload()}
+async function syncSignIn(){const email=document.getElementById("sbEmail").value.trim(),password=document.getElementById("sbPw").value;if(!email||!password){sbMsg("Indique ton e-mail et ton mot de passe.");return}sbMsg("Connexion…",true);try{localStorage.setItem("financeos_sync_email",email)}catch{}const r=await Sync.client.auth.signInWithPassword({email,password});if(r.error){sbMsg(authMsg(r.error));return}closeModal();toast("Connecté")}
+async function syncSignUp(){const email=document.getElementById("sbEmail").value.trim(),password=document.getElementById("sbPw").value;if(!email||password.length<6){sbMsg("Indique ton e-mail et un mot de passe d'au moins 6 caractères.");return}sbMsg("Création du compte…",true);try{localStorage.setItem("financeos_sync_email",email)}catch{}const r=await Sync.client.auth.signUp({email,password,options:{emailRedirectTo:location.origin+location.pathname}});if(r.error){sbMsg(authMsg(r.error));return}if(r.data&&r.data.session){closeModal();toast("Compte créé, synchro active");return}sbMsg("Compte créé. Ouvre le mail de confirmation, clique sur le lien, puis reviens ici et clique sur « Se connecter ».",true)}
+async function syncForgot(){const email=document.getElementById("sbEmail").value.trim();if(!email){sbMsg("Indique d'abord ton e-mail.");return}const r=await Sync.client.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname});sbMsg(r.error?authMsg(r.error):"Mail envoyé : clique sur le lien pour choisir un nouveau mot de passe.",!r.error)}
+async function syncNewPassword(){const pw=document.getElementById("sbNewPw").value;if(pw.length<6){sbMsg("6 caractères minimum.");return}const r=await Sync.client.auth.updateUser({password:pw});if(r.error){sbMsg(authMsg(r.error));return}closeModal();toast("Mot de passe changé")}
+async function syncSignOut(){if(!confirm("Se déconnecter ? Tes données restent sur cet appareil, mais ne se synchronisent plus."))return;if(Sync.timer)await cloudPush();await Sync.client.auth.signOut();closeModal();toast("Déconnecté")}
 function saveData(){persist();render()}
 function ensureMonth(key){if(data.months[key])return;const prev=Object.keys(data.months).filter(k=>k<key).sort().pop();if(prev){const p=data.months[prev];data.months[key]={salary:p.salary,monthlySavings:p.monthlySavings,expenses:structuredClone(p.expenses||[]),savedAmount:p.savedAmount,savingsGoal:p.savingsGoal}}else data.months[key]=defaultMonth()}
 function ensureCurrentMonth(){ensureMonth(currentKey)}
@@ -639,7 +701,7 @@ function isPristine(){return !data.bank.transactions.length&&!data.portfolio.len
 function maybeOfferReset(){let done=false;try{done=!!localStorage.getItem(RESET_FLAG)}catch{}if(done)return;if(isPristine()){try{localStorage.setItem(RESET_FLAG,"1")}catch{}return}
 openModal("Remise à zéro de FinanceOS",`<p class="text-sm text-zinc-300 mb-2">Comme demandé, cette version peut remettre toutes tes valeurs à 0 : budget, transactions, portefeuille, historique, objectifs et conversation.</p><p class="text-sm text-zinc-400 mb-5">Tes <strong>clés et connexions</strong> (Twelve Data, Gemini, Enable Banking, proxy) sont <strong>conservées</strong>. Si ta banque est connectée, la prochaine synchro réimportera les 90 derniers jours.</p><div class="flex flex-wrap justify-end gap-2"><button class="btn btn-secondary" onclick="try{localStorage.setItem(RESET_FLAG,'1')}catch{};closeModal()">Non, garder mes données</button><button class="btn btn-secondary" onclick="exportData()"><i class="fa-solid fa-download mr-1"></i>Sauvegarder d'abord</button><button class="btn btn-primary" onclick="wipeData(true);closeModal();toast('Tout est à 0 — clés et connexions conservées')">Remettre à 0</button></div>`)}
 function openModal(title,html,wide){document.getElementById("modalTitle").textContent=title;document.getElementById("modalContent").innerHTML=html;document.getElementById("modalBox").classList.toggle("wide",!!wide);document.getElementById("modalBg").classList.add("show")}
-function closeModal(){document.getElementById("modalBg").classList.remove("show");if(detailChartInstance){detailChartInstance.destroy();detailChartInstance=null}}
+function closeModal(){document.getElementById("modalBg").classList.remove("show");if(detailChartInstance){detailChartInstance.destroy();detailChartInstance=null}setTimeout(applyPendingRow,50)}
 function closeModalOutside(e){if(e.target.id==="modalBg")closeModal()}
 function toggleMobileMenu(){const a=document.querySelector("aside");a.style.display=a.style.display==="block"?"":"block"}
 function toast(msg){const t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),2500)}
@@ -904,7 +966,7 @@ chatBusy=true;inp.value="";chatErr="";data.chat.push({r:"user",t:msg});renderCha
 try{if(data.markets.apiKey&&!Object.keys(lastQuotes).some(k=>lastQuotes[k].src==="td"))await refreshMarkets();if(data.markets.finnhubKey&&!newsData)await refreshNews();if(!metals)await refreshMetals();
 if(localEngineReady)await sendChatLocal();else await sendChatGemini()}finally{chatBusy=false}
 const last=data.chat[data.chat.length-1];if(last&&last.r==="model"){const{clean,acts}=parseActions(last.t);last.t=clean||"(réponse vide)";if(acts.length)last.acts=acts}
-data.chat=data.chat.slice(-40);persist();renderChat()}
+data.chat=data.chat.slice(-40);persist();renderChat();setTimeout(applyPendingRow,50)}
 const sysPrompt=()=>SYS+(MODE_SYS[data.ai.mode]||"")+"\n\nDONNÉES ACTUELLES DE L'UTILISATEUR :\n"+chatContext();
 async function sendChatLocal(){let h=data.chat.slice(-5);while(h.length&&h[0].r!=="user")h.shift();
 const messages=[{role:"system",content:sysPrompt()},...h.map(x=>({role:x.r==="model"?"assistant":"user",content:x.t}))];
@@ -994,6 +1056,7 @@ el.innerHTML=bar("Besoins",r.needs,50,false,"courses, transport, factures, sant�
    CENTRE DE CONNEXIONS
    ========================================================= */
 function connStates(){const eb=data.bank.eb,ebExp=eb.validUntil&&new Date(eb.validUntil)<new Date();return[
+{k:"sync",ico:"fa-cloud",name:"Synchronisation téléphone ↔ PC (Supabase)",ok:Sync.status==="ok",warn:!!syncCfg(),detail:!syncCfg()?"Pas encore configurée":Sync.user?`Connecté : ${Sync.user.email||""}`:"Configurée, pas connecté",actions:`<button class="btn btn-primary text-xs" onclick="closeModal();setTimeout(()=>openSyncModal(),50)">${Sync.user?"Gérer":"Se connecter"}</button>`},
 {k:"bank",ico:"fa-building-columns",name:"Banque (Revolut via Enable Banking)",ok:!!(eb.sessionId&&eb.accounts.length&&!ebExp),warn:ebReady()&&!(eb.sessionId&&!ebExp),detail:eb.sessionId?(ebExp?"Autorisation expirée — reconnecte":`${eb.aspsp||"Banque"} · ${eb.accounts.length} compte(s) · valable jusqu'au ${eb.validUntil?new Date(eb.validUntil).toLocaleDateString("fr-FR"):"—"} · synchro ${relTime(data.bank.lastSync)}`):ebReady()?"Configuré, pas encore connecté":"Non configuré (facultatif : l'import de relevé suffit)",actions:`<button class="btn btn-secondary text-xs" onclick="closeModal();showPage('bank');openEBSettings()">Configurer</button>${ebReady()?`<button class="btn btn-secondary text-xs" onclick="testConn('bank')">Tester</button>`:""}${eb.sessionId&&!ebExp?`<button class="btn btn-primary text-xs" onclick="closeModal();showPage('bank');ebSync()">Synchroniser</button>`:""}`},
 {k:"csv",ico:"fa-file-import",name:"Relevés importés",ok:data.bank.transactions.length>0,detail:data.bank.transactions.length?`${data.bank.transactions.length} transactions · dernier ajout ${relTime(data.bank.lastSync)}`:"Aucun relevé importé",actions:`<button class="btn btn-secondary text-xs" onclick="closeModal();document.getElementById('revFile').click()">Importer</button>`},
 {k:"td",ico:"fa-chart-line",name:"Twelve Data (actions & ETF US)",ok:!!data.markets.apiKey&&Object.values(lastQuotes).some(q=>q.src==="td"),warn:!!data.markets.apiKey,detail:data.markets.apiKey?"Clé enregistrée":"Pas de clé (gratuite sur twelvedata.com)",actions:`<button class="btn btn-secondary text-xs" onclick="openMarketSettings()">Clé</button>${data.markets.apiKey?`<button class="btn btn-secondary text-xs" onclick="testConn('td')">Tester</button>`:""}`},
@@ -1005,7 +1068,7 @@ function connStates(){const eb=data.bank.eb,ebExp=eb.validUntil&&new Date(eb.val
 {k:"fx",ico:"fa-euro-sign",name:"BCE (devises, sans clé)",ok:!!fxRates,detail:fxRates?`Taux du ${new Date(fxDate+"T12:00").toLocaleDateString("fr-FR")}`:"Pas encore chargé",actions:`<button class="btn btn-secondary text-xs" onclick="testConn('fx')">Tester</button>`},
 {k:"ai",ico:"fa-robot",name:"Conseiller IA",ok:!!(data.ai.key||localEngineReady),warn:data.ai.localActivated,detail:data.ai.key?`Gemini (${data.ai.model})${data.ai.web?" + recherche web":""}`:localEngineReady?"IA locale active":data.ai.localActivated?"IA locale activée (se charge à l'ouverture du chat)":"Pas activé",actions:`<button class="btn btn-secondary text-xs" onclick="openMarketSettings()">Réglages</button>${data.ai.key?`<button class="btn btn-secondary text-xs" onclick="testConn('ai')">Tester</button>`:""}`},
 {k:"bk",ico:"fa-floppy-disk",name:"Sauvegarde",ok:!!data.lastBackup&&Date.now()-new Date(data.lastBackup)<30*864e5,warn:!!data.lastBackup,detail:data.lastBackup?"Dernière sauvegarde "+relTime(data.lastBackup):"Jamais sauvegardé — fais-le maintenant",actions:`<button class="btn btn-secondary text-xs" onclick="exportData()">Sauvegarder</button>`}]}
-function renderConnBadge(){const s=connStates().filter(x=>["bank","td","ai","bk"].includes(x.k)),n=s.filter(x=>x.ok).length;setHtml("connBadge",`<span class="pill" style="padding:1px 7px">${n}/${s.length}</span>`)}
+function renderConnBadge(){const s=connStates().filter(x=>["sync","bank","td","ai","bk"].includes(x.k)),n=s.filter(x=>x.ok).length;setHtml("connBadge",`<span class="pill" style="padding:1px 7px">${n}/${s.length}</span>`)}
 function openSettings(){openModal("Centre de connexions",`<p class="text-sm text-zinc-500 mb-4">Tout ce qui alimente FinanceOS. Vert = actif, orange = configuré mais à vérifier, gris = pas branché. Tes clés ne quittent jamais ce navigateur (sauf vers le service concerné).</p><div class="space-y-2">${connStates().map(c=>`<div class="flex flex-wrap items-center gap-3 p-3 rounded-xl bg-zinc-900"><span class="dot ${c.ok?"on":c.warn?"":"off"}" style="${!c.ok&&c.warn?"background:#f59e0b":""}"></span><i class="fa-solid ${c.ico} w-5 text-zinc-400"></i><div class="flex-1 min-w-[180px]"><div class="font-semibold text-sm">${escapeHtml(c.name)}</div><div class="text-xs text-zinc-500">${escapeHtml(c.detail)}</div><div id="test-${c.k}" class="text-xs mt-1"></div></div><div class="flex gap-2">${c.actions}</div></div>`).join("")}</div><div class="flex justify-between items-center gap-2 mt-6"><button class="btn btn-secondary text-xs" onclick="testAll()"><i class="fa-solid fa-stethoscope mr-1"></i> Tout tester</button><button class="btn btn-primary" onclick="closeModal()">Fermer</button></div>`,true)}
 async function testConn(k){const el=document.getElementById("test-"+k);const out=(ok,t)=>{if(el){el.className="text-xs mt-1 "+(ok?"text-emerald-400":"text-red-400");el.textContent=(ok?"✓ ":"✗ ")+t}};if(el){el.className="text-xs mt-1 text-zinc-400";el.textContent="Test en cours…"}
 try{if(k==="bank"){const j=await ebFetch(`/aspsps?country=${data.bank.eb.country}&psu_type=personal`);const n=(j.aspsps||[]).length,rv=(j.aspsps||[]).some(a=>/revolut/i.test(a.name));out(true,`API joignable · ${n} banques (${data.bank.eb.country})${rv?" dont Revolut":""}`)}
@@ -1130,7 +1193,7 @@ refreshFx();refreshCryptoRest();connectCryptoWS();if(data.markets.apiKey)refresh
 (function autoBankSync(){const eb=data.bank.eb;if(!ebReady()||!eb.sessionId||!eb.accounts.length)return;if(eb.validUntil&&new Date(eb.validUntil)<new Date())return;if(data.bank.lastSync&&Date.now()-new Date(data.bank.lastSync)<6*3600e3)return;setTimeout(()=>ebSync().catch(()=>{}),1500)})();
 if(data.autoRefresh)marketTimer=setInterval(()=>refreshMarkets(true),60000);
 setInterval(paintSessions,30000);
-setTimeout(maybeOfferReset,400)}
+setTimeout(maybeOfferReset,400);setSync("off");syncInit().catch(e=>{console.error(e);setSync("error")})}
 boot();
 if("serviceWorker" in navigator&&location.protocol==="https:")window.addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
 </script>

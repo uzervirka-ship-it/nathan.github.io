@@ -1,7 +1,7 @@
 /* FinanceOS — fonctionne hors connexion. Les données restent dans le navigateur (localStorage). */
-const VERSION = "financeos-v1";
-const SHELL = ["./", "index.html", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/favicon-32.png"];
-const LIBS = /^(https:\/\/cdn\.tailwindcss\.com|https:\/\/cdn\.jsdelivr\.net\/npm\/chart\.js@|https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/|https:\/\/fonts\.(googleapis|gstatic)\.com)/;
+const VERSION = "financeos-v2";
+const SHELL = ["./", "index.html", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/favicon-32.png", "config.js"];
+const LIBS = /^(https:\/\/cdn\.tailwindcss\.com|https:\/\/cdn\.jsdelivr\.net\/npm\/chart\.js@|https:\/\/cdn\.jsdelivr\.net\/npm\/@supabase\/supabase-js@|https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/|https:\/\/fonts\.(googleapis|gstatic)\.com)/;
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
